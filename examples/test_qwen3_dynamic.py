@@ -27,7 +27,12 @@ tokenizer = AutoTokenizer.from_pretrained(
     model.config.base_model, use_fast=True, padding_side="left"
 )
 
-prompt = "A train travels 120 kilometers in 3 hours at a constant speed. How many kilometers will it travel in 5 hours at the same speed?"
+prompt = """The $9$ members of a baseball team went to an ice-cream parlor after their game. 
+Each player had a single scoop cone of chocolate, vanilla, or strawberry ice cream. 
+At least one player chose each flavor, and the number of players who chose chocolate was greater than the number of players who chose vanilla, 
+which was greater than the number of players who chose strawberry. Let $N$ be the number of different assignments of flavors to players that
+meet these conditions. Find the remainder when $N$ is divided by 1000.
+"""
 messages = [
     {"role": "user", "content": prompt}
 ]
