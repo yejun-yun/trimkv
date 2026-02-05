@@ -857,6 +857,8 @@ class BatchedDynamicBudgetTrimKVCache(TrimKVCache):
 
         q_idx = self.get_seq_length() + 1
 
+        self._batch_layer_masks = {}
+
         for b in range(B):
             batch_scores_list = []
             batch_layer_lens = []
@@ -905,8 +907,6 @@ class BatchedDynamicBudgetTrimKVCache(TrimKVCache):
                 layer_mask_end = cu_batch_layer_lens[l + 1].item()
                 layer_mask = topk_mask[layer_mask_start:layer_mask_end]
 
-                if b == 0:
-                    self._batch_layer_masks = {}
                 self._batch_layer_masks[(b, l)] = (batch_token_start, batch_token_end, layer_mask)
 
         for l in range(num_layers):
