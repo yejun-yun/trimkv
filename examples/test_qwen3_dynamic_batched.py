@@ -25,7 +25,7 @@ tokenizer = AutoTokenizer.from_pretrained(
 tokenizer.pad_token = tokenizer.eos_token
 
 prompts = [
-    """A train travels 120 kilometers in 3 hours at a constant speed. How many kilometers will it travel in 5 hours at the same speed?"""
+    """A train travels 120 kilometers in 3 hours at a constant speed. How many kilometers will it travel in 5 hours at the same speed?""",
     """A train travels 120 kilometers in 3 hours at a constant speed. How many kilometers will it travel in 5 hours at the same speed?""",
 ]
 
