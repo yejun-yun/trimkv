@@ -6,7 +6,8 @@ from . import eager_attn
 from . import flash_attn
 
 TRIMKV_ATTENTION_IMPLEMENTATIONS = {
-    "db_attn_flash": flash_attn.dynamic_kv_budget_attention_forward, # Dynamic-KV-Budget Attention implementation using Flash Attention
+    "db_attn_flash": flash_attn.dynamic_kv_budget_attention_forward, # dynamic cache budget
+    "db_attn_flash_batched": flash_attn.batched_dynamic_kv_budget_attention_forward, # dynamic cache budget for batches of all same length
     "attn_eager": eager_attn.eager_attention_forward, # Standard Attention implementation using Eager Attention
 }
 
