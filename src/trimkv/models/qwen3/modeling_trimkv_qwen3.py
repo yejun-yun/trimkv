@@ -31,7 +31,7 @@ from transformers.models.qwen3 import Qwen3ForCausalLM, Qwen3Model
 from .configuration_trimkv_qwen3 import TrimKVQwen3Config
 
 from trimkv.attn import get_attention_interface 
-from trimkv.cache_utils import TrimKVCache
+from trimkv.cache_utils import TrimKVCache, BatchedDynamicBudgetTrimKVCache
 
 
 logger = logging.get_logger(__name__)
@@ -678,6 +678,12 @@ class TrimKVQwen3Model(TrimKVQwen3PreTrainedModel):
             # The sliding window alternating layers are not always activated depending on the config
             if self.has_sliding_layers:
                 causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+
+        # pass per-batch position info to batched cache - yejun
+        if isinstance(past_key_values, BatchedDynamicBudgetTrimKVCache):
+            if past_key_values.get_seq_length() == 0:
+                past_key_values._prefill_padding_mask = attention_mask  # (B, S), 0=pad 1=real
+            past_key_values._position_ids = position_ids  # (B, S), correct per-batch positions
 
         hidden_states = inputs_embeds
 

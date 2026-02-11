@@ -582,6 +582,7 @@ class BatchedDynamicBudgetTrimKVCache(TrimKVCache):
 
         self.batch_size: Optional[int] = None
         self.num_kv_heads: Optional[int] = None
+        self._per_batch_seen_tokens: Optional[torch.Tensor] = None  # (B,) - yejun
 
         self.device = device
         self.offset = torch.tensor(0, dtype=torch.int64)
@@ -614,6 +615,8 @@ class BatchedDynamicBudgetTrimKVCache(TrimKVCache):
 
             if layer_idx == 0:
                 self._seen_tokens += S
+                if self._per_batch_seen_tokens is not None:
+                    self._per_batch_seen_tokens += S
 
             if cache_positions.dim() == 1:
                 cache_positions = cache_positions[None, None, :].expand(B, H, S)
@@ -629,18 +632,45 @@ class BatchedDynamicBudgetTrimKVCache(TrimKVCache):
                     self.head_lens.append(torch.tensor([]))
                     self.cu_seqlens_k.append(torch.tensor([]))
 
-                key_flat = key_states.reshape(-1, D)
-                value_flat = value_states.reshape(-1, D)
-                cache_positions_flat = cache_positions.reshape(-1, 1)
-                retention_weights_flat = retention_weights.reshape(-1, 1)
+                # filter out left-padding tokens on prefill - yejun
+                position_ids = self._position_ids  # (B, S)
+                real_mask = self._prefill_padding_mask.bool()  # (B, S)
+                cache_positions = position_ids.unsqueeze(1).expand(B, H, S)  # (B, H, S)
+
+                real_lens = real_mask.sum(dim=1).int()  # (B,)
+                per_seq_lens = real_lens.unsqueeze(1).expand(B, H).reshape(-1)  # (B*H,)
+
+                key_chunks = []
+                val_chunks = []
+                rw_chunks = []
+                pos_chunks = []
+                for b in range(B):
+                    m = real_mask[b]  # (S,)
+                    key_chunks.append(key_states[b, :, m, :].reshape(-1, D))
+                    val_chunks.append(value_states[b, :, m, :].reshape(-1, D))
+                    rw_chunks.append(retention_weights[b, :, m].reshape(-1, 1))
+                    pos_chunks.append(cache_positions[b, :, m].reshape(-1, 1))
+
+                key_flat = torch.cat(key_chunks, dim=0)
+                value_flat = torch.cat(val_chunks, dim=0)
+                retention_weights_flat = torch.cat(rw_chunks, dim=0)
+                cache_positions_flat = torch.cat(pos_chunks, dim=0)
+
+                self.head_lens.append(per_seq_lens.to(device=self.device, dtype=torch.int32))
+                self.cu_seqlens_k.append(torch.cumsum(
+                    torch.cat([torch.zeros(1, device=self.device, dtype=torch.int32), per_seq_lens.to(device=self.device, dtype=torch.int32)]),
+                    dim=0, dtype=torch.int32,
+                ))
+
+                # track per-batch seen tokens for correct compression q_idx - yejun
+                if layer_idx == 0:
+                    self._per_batch_seen_tokens = real_lens.to(device=self.device, dtype=torch.long)
+                    self._seen_tokens = self._seen_tokens - S + real_lens.max().item()
 
                 self.key_cache.append(key_flat)
                 self.value_cache.append(value_flat)
                 self.retention_weights.append(retention_weights_flat)
                 self.kv_positions.append(cache_positions_flat)
-
-                self.head_lens.append(torch.full((num_seqs,), S, device=self.device, dtype=torch.int32))
-                self.cu_seqlens_k.append(torch.arange(0, num_seqs * S + 1, S, device=self.device, dtype=torch.int32))
 
             else:
                 key_states_reshaped = key_states.reshape(1, num_seqs, S, D)
@@ -660,6 +690,8 @@ class BatchedDynamicBudgetTrimKVCache(TrimKVCache):
                 )
 
                 retention_weights_reshaped = retention_weights.reshape(1, num_seqs, S, 1)
+                # use per-batch position_ids for correct positions with unequal prompts - yejun
+                cache_positions = self._position_ids.unsqueeze(1).expand(B, H, S)  # (B, H, S)
                 cache_positions_reshaped = cache_positions.reshape(1, num_seqs, S, 1)
 
                 self.retention_weights[layer_idx] = update_flatten_view_triton(
@@ -751,16 +783,8 @@ class BatchedDynamicBudgetTrimKVCache(TrimKVCache):
         rw = self.retention_weights[layer_idx].squeeze(-1)
         kv_pos = self.kv_positions[layer_idx].squeeze(-1)
 
-        q_idx = self.get_seq_length() + 1
-        log_alpha = (q_idx - kv_pos) * rw
-
-        if strategy == "knorm_alpha":
-            key_norm = self.key_cache[layer_idx].norm(dim=-1).reshape(-1)
-            scores = log_alpha + torch.log(key_norm.clamp_min(1e-12))
-        elif strategy == "alpha":
-            scores = log_alpha
-        else:
-            raise ValueError(f"Unknown compression strategy: {strategy}")
+        # compute per-batch q_idx for correct scores with unequal prompts - yejun
+        q_idx_per_batch = self._per_batch_seen_tokens + 1  # (B,)
 
         new_key_chunks = []
         new_value_chunks = []
@@ -775,7 +799,17 @@ class BatchedDynamicBudgetTrimKVCache(TrimKVCache):
             batch_token_start = self.cu_seqlens_k[layer_idx][batch_start_seq].item()
             batch_token_end = self.cu_seqlens_k[layer_idx][batch_end_seq].item()
 
-            batch_scores = scores[batch_token_start:batch_token_end]
+            batch_rw = rw[batch_token_start:batch_token_end]
+            batch_kv_pos = kv_pos[batch_token_start:batch_token_end]
+            log_alpha = (q_idx_per_batch[b] - batch_kv_pos) * batch_rw
+
+            if strategy == "knorm_alpha":
+                key_norm = self.key_cache[layer_idx][batch_token_start:batch_token_end].norm(dim=-1).reshape(-1)
+                batch_scores = log_alpha + torch.log(key_norm.clamp_min(1e-12))
+            elif strategy == "alpha":
+                batch_scores = log_alpha
+            else:
+                raise ValueError(f"Unknown compression strategy: {strategy}")
             batch_tokens = batch_token_end - batch_token_start
 
             k = min(memory_size * H, batch_tokens)
@@ -855,7 +889,7 @@ class BatchedDynamicBudgetTrimKVCache(TrimKVCache):
         if tokens_per_batch_current <= num_layers * H * (memory_size + buffer_size) and "threshold" not in strategy:
             return
 
-        q_idx = self.get_seq_length() + 1
+        q_idx_per_batch = self._per_batch_seen_tokens + 1  # (B,) - yejun
 
         self._batch_layer_masks = {}
 
@@ -871,7 +905,7 @@ class BatchedDynamicBudgetTrimKVCache(TrimKVCache):
 
                 rw = self.retention_weights[l][batch_token_start:batch_token_end].squeeze(-1)
                 kv_pos = self.kv_positions[l][batch_token_start:batch_token_end].squeeze(-1)
-                log_alpha = (q_idx - kv_pos) * rw
+                log_alpha = (q_idx_per_batch[b] - kv_pos) * rw
 
                 if strategy in ["knorm_alpha", "knorm_alpha_threshold"]:
                     key_norm = self.key_cache[l][batch_token_start:batch_token_end].norm(dim=-1)
