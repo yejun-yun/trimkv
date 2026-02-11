@@ -117,12 +117,9 @@ def batched_dynamic_kv_budget_attention_forward(
     N_Q_PER_GROUP = N_HEADS // N_KV_HEADS
     num_seqs = batch_size * N_KV_HEADS
 
-    query = query.transpose(1, 2).reshape(B * Q_LEN, N_HEADS, HEAD_DIM)
-    query_groups = torch.split(query, N_Q_PER_GROUP, dim=1)
-    query_groups = [g.view(B, Q_LEN, N_Q_PER_GROUP, HEAD_DIM) for g in query_groups]
-    query_stacked = torch.stack(query_groups, dim=0)
-    query_stacked = query_stacked.permute(1, 0, 2, 3, 4)
-    packed_query = query_stacked.reshape(num_seqs * Q_LEN, N_Q_PER_GROUP, HEAD_DIM)
+    query = query.view(B, N_KV_HEADS, N_Q_PER_GROUP, Q_LEN, HEAD_DIM)
+    query = query.transpose(2, 3)
+    packed_query = query.reshape(num_seqs * Q_LEN, N_Q_PER_GROUP, HEAD_DIM)
 
     cu_seqlens_q = torch.arange(
         0, num_seqs * Q_LEN + 1, Q_LEN,
