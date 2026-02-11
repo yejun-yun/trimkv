@@ -779,92 +779,62 @@ class BatchedDynamicBudgetTrimKVCache(TrimKVCache):
         device = self.device
         B = self.batch_size
         H = self.num_kv_heads
+        num_seqs = B * H
 
-        rw = self.retention_weights[layer_idx].squeeze(-1)
-        kv_pos = self.kv_positions[layer_idx].squeeze(-1)
+        rw = self.retention_weights[layer_idx].squeeze(-1)   # (T,)
+        kv_pos = self.kv_positions[layer_idx].squeeze(-1)     # (T,)
+        T = rw.shape[0]
 
-        # compute per-batch q_idx for correct scores with unequal prompts - yejun
-        q_idx_per_batch = self._per_batch_seen_tokens + 1  # (B,)
+        # broadcast per-batch q_idx to every token without looping - yejun
+        cu = self.cu_seqlens_k[layer_idx]                     # (B*H+1,)
+        # map each token to its seq index, then to its batch index
+        seq_idx = torch.bucketize(torch.arange(T, device=device), cu[1:], right=True)  # (T,)
+        batch_idx = seq_idx // H                              # (T,)
+        q_idx = self._per_batch_seen_tokens[batch_idx] + 1    # (T,)
 
-        new_key_chunks = []
-        new_value_chunks = []
-        new_rw_chunks = []
-        new_pos_chunks = []
-        new_head_lens = []
+        log_alpha = (q_idx - kv_pos) * rw
 
-        for b in range(B):
-            batch_start_seq = b * H
-            batch_end_seq = (b + 1) * H
+        if strategy == "knorm_alpha":
+            key_norm = self.key_cache[layer_idx].norm(dim=-1).reshape(-1)
+            scores = log_alpha + torch.log(key_norm.clamp_min(1e-12))
+        elif strategy == "alpha":
+            scores = log_alpha
+        else:
+            raise ValueError(f"Unknown compression strategy: {strategy}")
 
-            batch_token_start = self.cu_seqlens_k[layer_idx][batch_start_seq].item()
-            batch_token_end = self.cu_seqlens_k[layer_idx][batch_end_seq].item()
+        # pad scores into (B, max_tokens_per_batch) for batched topk - yejun
+        batch_starts = cu[::H]                                # (B+1,)
+        batch_lens = batch_starts[1:] - batch_starts[:-1]     # (B,)
+        max_batch_len = batch_lens.max().item()
+        k = memory_size * H
 
-            batch_rw = rw[batch_token_start:batch_token_end]
-            batch_kv_pos = kv_pos[batch_token_start:batch_token_end]
-            log_alpha = (q_idx_per_batch[b] - batch_kv_pos) * batch_rw
+        # scatter flat scores into padded (B, max_batch_len) tensor - yejun
+        within_batch_pos = torch.arange(T, device=device, dtype=torch.long) - batch_starts[batch_idx]
+        padded_scores = torch.full((B, max_batch_len), float('-inf'), device=device, dtype=scores.dtype)
+        padded_scores[batch_idx, within_batch_pos] = scores
 
-            if strategy == "knorm_alpha":
-                key_norm = self.key_cache[layer_idx][batch_token_start:batch_token_end].norm(dim=-1).reshape(-1)
-                batch_scores = log_alpha + torch.log(key_norm.clamp_min(1e-12))
-            elif strategy == "alpha":
-                batch_scores = log_alpha
-            else:
-                raise ValueError(f"Unknown compression strategy: {strategy}")
-            batch_tokens = batch_token_end - batch_token_start
+        topk_indices = torch.topk(padded_scores, min(k, max_batch_len), dim=-1, largest=True, sorted=False).indices  # (B, k)
 
-            k = min(memory_size * H, batch_tokens)
-            if floor_budget_ratio > 0:
-                k = min(int(memory_size * H * (1 - floor_budget_ratio)), batch_tokens)
+        # convert padded topk indices back to a flat mask - yejun
+        # filter out indices that point to -inf padding columns
+        valid_mask = topk_indices < batch_lens.unsqueeze(1)   # (B, k)
+        flat_idx = batch_starts[:-1].unsqueeze(1) + topk_indices  # (B, k)
+        topk_mask = torch.zeros(T, dtype=torch.bool, device=device)
+        topk_mask[flat_idx[valid_mask]] = True
 
-            topk_idx = torch.topk(batch_scores, k, largest=True, sorted=False).indices
-            topk_mask = torch.zeros(batch_tokens, dtype=torch.bool, device=device)
-            topk_mask.index_fill_(0, topk_idx, True)
+        # apply mask to all cache tensors at once - yejun
+        self.key_cache[layer_idx] = self.key_cache[layer_idx][topk_mask]
+        self.value_cache[layer_idx] = self.value_cache[layer_idx][topk_mask]
+        self.retention_weights[layer_idx] = self.retention_weights[layer_idx][topk_mask]
+        self.kv_positions[layer_idx] = self.kv_positions[layer_idx][topk_mask]
 
-            if floor_budget_ratio > 0:
-                floor_per_head = int(memory_size * floor_budget_ratio)
-                for h in range(H):
-                    seq_idx = b * H + h
-                    head_start = self.cu_seqlens_k[layer_idx][seq_idx].item() - batch_token_start
-                    head_end = self.cu_seqlens_k[layer_idx][seq_idx + 1].item() - batch_token_start
-                    head_len = head_end - head_start
-
-                    head_mask = topk_mask[head_start:head_end]
-                    already_selected = head_mask.sum().item()
-
-                    need = max(0, floor_per_head - already_selected)
-                    if need > 0 and head_len > already_selected:
-                        head_scores = batch_scores[head_start:head_end]
-                        head_scores_masked = head_scores.clone()
-                        head_scores_masked[head_mask] = float('-inf')
-                        floor_idx = torch.topk(head_scores_masked, min(need, head_len - already_selected), largest=True).indices
-                        topk_mask[head_start + floor_idx] = True
-
-            batch_key = self.key_cache[layer_idx][batch_token_start:batch_token_end][topk_mask]
-            batch_value = self.value_cache[layer_idx][batch_token_start:batch_token_end][topk_mask]
-            batch_rw = self.retention_weights[layer_idx][batch_token_start:batch_token_end][topk_mask]
-            batch_pos = self.kv_positions[layer_idx][batch_token_start:batch_token_end][topk_mask]
-
-            new_key_chunks.append(batch_key)
-            new_value_chunks.append(batch_value)
-            new_rw_chunks.append(batch_rw)
-            new_pos_chunks.append(batch_pos)
-
-            for h in range(H):
-                seq_idx = b * H + h
-                head_start = self.cu_seqlens_k[layer_idx][seq_idx].item() - batch_token_start
-                head_end = self.cu_seqlens_k[layer_idx][seq_idx + 1].item() - batch_token_start
-                new_head_lens.append(topk_mask[head_start:head_end].sum().item())
-
-        self.key_cache[layer_idx] = torch.cat(new_key_chunks, dim=0)
-        self.value_cache[layer_idx] = torch.cat(new_value_chunks, dim=0)
-        self.retention_weights[layer_idx] = torch.cat(new_rw_chunks, dim=0)
-        self.kv_positions[layer_idx] = torch.cat(new_pos_chunks, dim=0)
-
-        self.head_lens[layer_idx] = torch.tensor(new_head_lens, device=device, dtype=torch.int32)
+        # recompute head_lens from mask using segment reduction - yejun
+        per_seq_mask = torch.zeros(num_seqs, device=device, dtype=torch.int32)
+        per_seq_mask.index_add_(0, seq_idx[topk_mask], torch.ones(topk_mask.sum(), device=device, dtype=torch.int32))
+        self.head_lens[layer_idx] = per_seq_mask
         self.cu_seqlens_k[layer_idx] = torch.cumsum(
-            torch.cat([torch.zeros(1, device=device, dtype=torch.int32), self.head_lens[layer_idx]], dim=0),
-            dim=0,
-            dtype=torch.int32,
+            torch.cat([torch.zeros(1, device=device, dtype=torch.int32), per_seq_mask]),
+            dim=0, dtype=torch.int32,
         )
 
     def _compress_all_layers_batched(
@@ -880,6 +850,7 @@ class BatchedDynamicBudgetTrimKVCache(TrimKVCache):
         num_layers = len(self.key_cache) if num_layers is None else num_layers
         B = self.batch_size
         H = self.num_kv_heads
+        num_seqs = B * H
 
         total_budget_per_batch = num_layers * H * memory_size
 
@@ -891,92 +862,96 @@ class BatchedDynamicBudgetTrimKVCache(TrimKVCache):
 
         q_idx_per_batch = self._per_batch_seen_tokens + 1  # (B,) - yejun
 
-        self._batch_layer_masks = {}
-
-        for b in range(B):
-            batch_scores_list = []
-            batch_layer_lens = []
-
-            for l in range(num_layers):
-                batch_start_seq = b * H
-                batch_end_seq = (b + 1) * H
-                batch_token_start = self.cu_seqlens_k[l][batch_start_seq].item()
-                batch_token_end = self.cu_seqlens_k[l][batch_end_seq].item()
-
-                rw = self.retention_weights[l][batch_token_start:batch_token_end].squeeze(-1)
-                kv_pos = self.kv_positions[l][batch_token_start:batch_token_end].squeeze(-1)
-                log_alpha = (q_idx_per_batch[b] - kv_pos) * rw
-
-                if strategy in ["knorm_alpha", "knorm_alpha_threshold"]:
-                    key_norm = self.key_cache[l][batch_token_start:batch_token_end].norm(dim=-1)
-                    layer_scores = log_alpha + torch.log(key_norm.clamp_min(1e-12))
-                elif strategy in ["alpha", "alpha_threshold"]:
-                    layer_scores = log_alpha
-                else:
-                    raise ValueError(f"Unknown compression strategy: {strategy}")
-
-                batch_scores_list.append(layer_scores)
-                batch_layer_lens.append(batch_token_end - batch_token_start)
-
-            all_batch_scores = torch.cat(batch_scores_list, dim=0)
-            cu_batch_layer_lens = torch.cumsum(
-                torch.tensor([0] + batch_layer_lens, dtype=torch.long), dim=0
-            )
-
-            if "threshold" in strategy:
-                topk_mask = all_batch_scores >= torch.log(torch.tensor(alpha_threshold, device=device))
-            else:
-                k = min(total_budget_per_batch, all_batch_scores.shape[0])
-                topk_idx = torch.topk(all_batch_scores, k, largest=True, sorted=False).indices
-                topk_mask = torch.zeros_like(all_batch_scores, dtype=torch.bool)
-                topk_mask.index_fill_(0, topk_idx, True)
-
-            for l in range(num_layers):
-                batch_start_seq = b * H
-                batch_end_seq = (b + 1) * H
-                batch_token_start = self.cu_seqlens_k[l][batch_start_seq].item()
-                batch_token_end = self.cu_seqlens_k[l][batch_end_seq].item()
-
-                layer_mask_start = cu_batch_layer_lens[l].item()
-                layer_mask_end = cu_batch_layer_lens[l + 1].item()
-                layer_mask = topk_mask[layer_mask_start:layer_mask_end]
-
-                self._batch_layer_masks[(b, l)] = (batch_token_start, batch_token_end, layer_mask)
+        # compute scores for all layers, broadcast q_idx per token - yejun
+        all_scores = []       # flat scores per layer
+        all_seq_idx = []      # seq index per token per layer (for head_lens later)
+        all_batch_idx = []    # batch index per token per layer
+        per_layer_batch_lens = []  # (num_layers, B) token count per batch per layer
 
         for l in range(num_layers):
-            new_key_chunks = []
-            new_value_chunks = []
-            new_rw_chunks = []
-            new_pos_chunks = []
-            new_head_lens = []
+            cu = self.cu_seqlens_k[l]
+            T_l = self.key_cache[l].shape[0]
+            seq_idx = torch.bucketize(torch.arange(T_l, device=device), cu[1:], right=True)
+            batch_idx = seq_idx // H
+            q_idx = q_idx_per_batch[batch_idx]
 
-            for b in range(B):
-                batch_token_start, batch_token_end, layer_mask = self._batch_layer_masks[(b, l)]
+            rw = self.retention_weights[l].squeeze(-1)
+            kv_pos = self.kv_positions[l].squeeze(-1)
+            log_alpha = (q_idx - kv_pos) * rw
 
-                new_key_chunks.append(self.key_cache[l][batch_token_start:batch_token_end][layer_mask])
-                new_value_chunks.append(self.value_cache[l][batch_token_start:batch_token_end][layer_mask])
-                new_rw_chunks.append(self.retention_weights[l][batch_token_start:batch_token_end][layer_mask])
-                new_pos_chunks.append(self.kv_positions[l][batch_token_start:batch_token_end][layer_mask])
+            if strategy in ["knorm_alpha", "knorm_alpha_threshold"]:
+                key_norm = self.key_cache[l].norm(dim=-1).reshape(-1)
+                scores = log_alpha + torch.log(key_norm.clamp_min(1e-12))
+            elif strategy in ["alpha", "alpha_threshold"]:
+                scores = log_alpha
+            else:
+                raise ValueError(f"Unknown compression strategy: {strategy}")
 
-                for h in range(H):
-                    seq_idx = b * H + h
-                    head_start = self.cu_seqlens_k[l][seq_idx].item() - batch_token_start
-                    head_end = self.cu_seqlens_k[l][seq_idx + 1].item() - batch_token_start
-                    new_head_lens.append(layer_mask[head_start:head_end].sum().item())
+            all_scores.append(scores)
+            all_seq_idx.append(seq_idx)
+            all_batch_idx.append(batch_idx)
 
-            self.key_cache[l] = torch.cat(new_key_chunks, dim=0)
-            self.value_cache[l] = torch.cat(new_value_chunks, dim=0)
-            self.retention_weights[l] = torch.cat(new_rw_chunks, dim=0)
-            self.kv_positions[l] = torch.cat(new_pos_chunks, dim=0)
+            batch_lens = torch.zeros(B, device=device, dtype=torch.long)
+            batch_lens.index_add_(0, batch_idx, torch.ones(T_l, device=device, dtype=torch.long))
+            per_layer_batch_lens.append(batch_lens)
 
-            self.head_lens[l] = torch.tensor(new_head_lens, device=device, dtype=torch.int32)
+        # concatenate scores across layers, grouped by batch for padded topk - yejun
+        # total tokens per batch across all layers
+        per_batch_total = torch.stack(per_layer_batch_lens).sum(dim=0)  # (B,)
+        max_total = per_batch_total.max().item()
+
+        # build (B, max_total) padded score tensor and track flat indices
+        padded_scores = torch.full((B, max_total), float('-inf'), device=device, dtype=all_scores[0].dtype)
+        # flat_indices[b] maps padded column -> (layer, flat_token_idx)
+        batch_offsets = torch.zeros(B, device=device, dtype=torch.long)
+
+        # per-layer flat masks, to be filled after topk
+        flat_masks = [torch.zeros(s.shape[0], device=device, dtype=torch.bool) for s in all_scores]
+        # mapping: for each (layer, token), what padded column it went to
+        layer_padded_cols = []
+
+        for l in range(num_layers):
+            T_l = all_scores[l].shape[0]
+            batch_idx = all_batch_idx[l]
+            cu = self.cu_seqlens_k[l]
+            # tokens are contiguous per batch, batch b starts at cu[b*H] - yejun
+            batch_starts = cu[::H]  # (B+1,)
+            within_batch_idx = torch.arange(T_l, device=device, dtype=torch.long) - batch_starts[batch_idx]
+            padded_cols = within_batch_idx + batch_offsets[batch_idx]
+            padded_scores[batch_idx, padded_cols] = all_scores[l]
+            layer_padded_cols.append(padded_cols)
+            batch_offsets += per_layer_batch_lens[l]
+
+        # batched topk or threshold - yejun
+        if "threshold" in strategy:
+            padded_mask = padded_scores >= torch.log(torch.tensor(alpha_threshold, device=device))
+        else:
+            k = min(total_budget_per_batch, max_total)
+            topk_indices = torch.topk(padded_scores, k, dim=-1, largest=True, sorted=False).indices  # (B, k)
+            padded_mask = torch.zeros_like(padded_scores, dtype=torch.bool)
+            padded_mask.scatter_(1, topk_indices, True)
+
+        # scatter padded mask back to per-layer flat masks - yejun
+        for l in range(num_layers):
+            batch_idx = all_batch_idx[l]
+            padded_cols = layer_padded_cols[l]
+            flat_masks[l] = padded_mask[batch_idx, padded_cols]
+
+        # apply masks and recompute head_lens per layer - yejun
+        for l in range(num_layers):
+            mask = flat_masks[l]
+            self.key_cache[l] = self.key_cache[l][mask]
+            self.value_cache[l] = self.value_cache[l][mask]
+            self.retention_weights[l] = self.retention_weights[l][mask]
+            self.kv_positions[l] = self.kv_positions[l][mask]
+
+            per_seq_mask = torch.zeros(num_seqs, device=device, dtype=torch.int32)
+            per_seq_mask.index_add_(0, all_seq_idx[l][mask], torch.ones(mask.sum(), device=device, dtype=torch.int32))
+            self.head_lens[l] = per_seq_mask
             self.cu_seqlens_k[l] = torch.cumsum(
-                torch.cat([torch.zeros(1, device=device, dtype=torch.int32), self.head_lens[l]], dim=0),
-                dim=0,
-                dtype=torch.int32,
+                torch.cat([torch.zeros(1, device=device, dtype=torch.int32), per_seq_mask]),
+                dim=0, dtype=torch.int32,
             )
-
-        del self._batch_layer_masks
 
     def log(self):
         num_layers = len(self.head_lens)
