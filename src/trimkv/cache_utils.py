@@ -984,13 +984,14 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
     def __init__(
         self,
         max_seq_len: int = 20480,
-        page_size: int = 32,
+        page_size: int = 256,
         _distributed_cache_data: Iterable = None,
         device: str = "cuda",
     ) -> None:
         super().__init__()
         self.max_seq_len = max_seq_len
         self.page_size = page_size
+        assert page_size % 256 == 0, f"page_size must be divisible by 256 (flash_attn requirement), got {page_size}"
 
         self._seen_tokens = 0
         self.key_cache: List[torch.Tensor] = []
