@@ -1383,7 +1383,7 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
         for l in range(num_layers):
             cols = H * all_max_padded[l]
             layer_keep = keep_pooled[:, col_offset:col_offset + cols]
-            keep_mask = layer_keep.view(num_seqs, all_max_padded[l])
+            keep_mask = layer_keep.reshape(num_seqs, all_max_padded[l])
             self._apply_eviction_paged(l, keep_mask)
             col_offset += cols
 
