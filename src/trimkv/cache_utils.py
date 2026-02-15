@@ -1257,49 +1257,57 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
     def _apply_eviction_paged(self, layer_idx: int, keep_mask: torch.Tensor):
         """Fill-from-tail compaction: swap tail tokens into gaps.
 
-        keep_mask: (num_seqs, max_padded) bool
-        Cost: O(evicted_tokens) copies per sequence, not O(surviving_tokens).
+        keep_mask: (num_seqs, max_padded) bool — True for tokens to keep.
+        Fully vectorized across all sequences. Cost: O(total_swaps * D) data movement.
         """
+        device = self.device
         bt = self.block_tables[layer_idx]
         seqlens = self.cache_seqlens[layer_idx]
         num_seqs = bt.shape[0]
         page_size = self.page_size
+        max_padded = keep_mask.shape[1]
 
-        for s in range(num_seqs):
-            L = seqlens[s].item()
-            mask_s = keep_mask[s, :L]
-            K = mask_s.sum().item()
+        # K per sequence: number of surviving tokens
+        valid_mask = torch.arange(max_padded, device=device).unsqueeze(0) < seqlens.unsqueeze(1)
+        K = (keep_mask & valid_mask).sum(dim=1)  # (num_seqs,)
 
-            if K == L:
-                continue
+        # Identify gaps (positions < K that are NOT kept) and tails (positions >= K that ARE kept)
+        pos_range = torch.arange(max_padded, device=device).unsqueeze(0)  # (1, max_padded)
+        is_front = pos_range < K.unsqueeze(1)
+        is_gap = is_front & ~keep_mask & valid_mask
+        is_tail = ~is_front & keep_mask & valid_mask
 
-            # Gaps: positions < K that are evicted (need to be filled)
-            # Tails: positions >= K that are kept (need to move into gaps)
-            gap_positions = (~mask_s[:K]).nonzero(as_tuple=True)[0]
-            tail_positions = mask_s[K:].nonzero(as_tuple=True)[0] + K
+        # nonzero returns (total_swaps, 2) sorted by (seq_idx, position)
+        # Since #gaps == #tails per sequence, entries are naturally aligned
+        gap_all = is_gap.nonzero(as_tuple=False)    # (total_swaps, 2)
+        tail_all = is_tail.nonzero(as_tuple=False)   # (total_swaps, 2)
 
-            if gap_positions.shape[0] > 0:
-                gap_page_idx = gap_positions // page_size
-                gap_offsets = gap_positions % page_size
-                tail_page_idx = tail_positions // page_size
-                tail_offsets = tail_positions % page_size
+        if gap_all.shape[0] > 0:
+            gap_seqs, gap_pos = gap_all[:, 0], gap_all[:, 1]
+            tail_seqs, tail_pos = tail_all[:, 0], tail_all[:, 1]
 
-                gap_blocks = bt[s, gap_page_idx].long()
-                tail_blocks = bt[s, tail_page_idx].long()
+            gap_blocks = bt[gap_seqs, gap_pos // page_size].long()
+            gap_offsets = gap_pos % page_size
+            tail_blocks = bt[tail_seqs, tail_pos // page_size].long()
+            tail_offsets = tail_pos % page_size
 
-                self.key_cache[layer_idx][gap_blocks, gap_offsets] = self.key_cache[layer_idx][tail_blocks, tail_offsets]
-                self.value_cache[layer_idx][gap_blocks, gap_offsets] = self.value_cache[layer_idx][tail_blocks, tail_offsets]
-                self.retention_weights[layer_idx][gap_blocks, gap_offsets] = self.retention_weights[layer_idx][tail_blocks, tail_offsets]
-                self.kv_positions[layer_idx][gap_blocks, gap_offsets] = self.kv_positions[layer_idx][tail_blocks, tail_offsets]
+            # Single vectorized scatter for all sequences
+            self.key_cache[layer_idx][gap_blocks, gap_offsets] = self.key_cache[layer_idx][tail_blocks, tail_offsets]
+            self.value_cache[layer_idx][gap_blocks, gap_offsets] = self.value_cache[layer_idx][tail_blocks, tail_offsets]
+            self.retention_weights[layer_idx][gap_blocks, gap_offsets] = self.retention_weights[layer_idx][tail_blocks, tail_offsets]
+            self.kv_positions[layer_idx][gap_blocks, gap_offsets] = self.kv_positions[layer_idx][tail_blocks, tail_offsets]
 
-            # Update seqlen and free empty tail pages
-            self.cache_seqlens[layer_idx][s] = K
-            new_num_blocks = (K + page_size - 1) // page_size if K > 0 else 0
-            old_num_blocks = (L + page_size - 1) // page_size
-            if new_num_blocks < old_num_blocks:
-                freed = bt[s, new_num_blocks:old_num_blocks]
-                self._release_blocks(layer_idx, freed[freed >= 0])
-                bt[s, new_num_blocks:old_num_blocks] = -1
+        # Update seqlens
+        old_num_blocks = (seqlens + page_size - 1) // page_size
+        self.cache_seqlens[layer_idx] = K.int()
+        new_num_blocks = torch.where(K > 0, (K + page_size - 1) // page_size, torch.zeros_like(K))
+
+        # Free empty tail pages — small loop only over sequences that freed blocks
+        freed_seqs = (new_num_blocks < old_num_blocks).nonzero(as_tuple=True)[0]
+        for s in freed_seqs.tolist():
+            freed = bt[s, new_num_blocks[s]:old_num_blocks[s]]
+            self._release_blocks(layer_idx, freed[freed >= 0])
+            bt[s, new_num_blocks[s]:old_num_blocks[s]] = -1
 
     def _compress_layer_paged(
         self,
