@@ -1170,7 +1170,7 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
 
         return self.key_cache[layer_idx], self.value_cache[layer_idx], self.retention_weights[layer_idx], self.kv_positions[layer_idx], flash_attn_kwargs
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def compress(
         self,
         strategy: str = "alpha",
