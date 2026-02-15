@@ -3,7 +3,8 @@ from typing import List
 from einops import rearrange
 
 from torch import nn
-from flash_attn.flash_attn_interface import flash_attn_varlen_func
+from flash_attn.flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
+
 
 
 
@@ -141,6 +142,63 @@ def batched_dynamic_kv_budget_attention_forward(
         causal=True,
     )
 
+    attn_output = attn_output.view(B, N_KV_HEADS, Q_LEN, N_Q_PER_GROUP, HEAD_DIM)
+    attn_output = attn_output.permute(0, 2, 1, 3, 4)
+    attn_output = attn_output.reshape(B, Q_LEN, N_HEADS, HEAD_DIM)
+
+    return attn_output, None, None
+
+
+def paged_dynamic_kv_budget_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor,
+    scaling: float = None,
+    dropout_p: float = 0.0,
+    flash_attn_kwargs: dict = {},
+    **kwargs,
+):
+    """
+    Flash Attention with paged KV cache and dynamic budget support for batch_size >= 1.
+    Each (batch, kv_head) pair is treated as an independent sequence with nheads_k=1,
+    enabling per-head different cache lengths after compression.
+
+    Args:
+        query: Query tensor [B, N_HEADS, Q_LEN, HEAD_DIM].
+        key: Paged K cache [num_blocks, page_size, 1, HEAD_DIM].
+        value: Paged V cache [num_blocks, page_size, 1, HEAD_DIM].
+        attention_mask: Not used.
+
+    Returns:
+        attn_output: Attention output tensor [B, Q_LEN, N_HEADS, HEAD_DIM].
+        None, None: Placeholder for compatibility.
+    """
+    block_table = flash_attn_kwargs.get("block_table")
+    cache_seqlens = flash_attn_kwargs.get("cache_seqlens")
+    batch_size = flash_attn_kwargs.get("batch_size")
+    num_kv_heads = flash_attn_kwargs.get("num_kv_heads")
+
+    B, N_HEADS, Q_LEN, HEAD_DIM = query.shape
+    N_KV_HEADS = num_kv_heads
+    N_Q_PER_GROUP = N_HEADS // N_KV_HEADS
+
+    # (B, N_HEADS, Q_LEN, D) -> (B*N_KV_HEADS, Q_LEN, N_Q_PER_GROUP, D)
+    q = query.view(B, N_KV_HEADS, N_Q_PER_GROUP, Q_LEN, HEAD_DIM)
+    q = q.transpose(2, 3)
+    q = q.reshape(B * N_KV_HEADS, Q_LEN, N_Q_PER_GROUP, HEAD_DIM)
+
+    attn_output = flash_attn_with_kvcache(
+        q,
+        key,
+        value,
+        cache_seqlens=cache_seqlens,
+        block_table=block_table,
+        causal=True,
+    )
+
+    # (B*N_KV_HEADS, Q_LEN, N_Q_PER_GROUP, D) -> (B, Q_LEN, N_HEADS, D)
     attn_output = attn_output.view(B, N_KV_HEADS, Q_LEN, N_Q_PER_GROUP, HEAD_DIM)
     attn_output = attn_output.permute(0, 2, 1, 3, 4)
     attn_output = attn_output.reshape(B, Q_LEN, N_HEADS, HEAD_DIM)
