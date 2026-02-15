@@ -1001,7 +1001,8 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
 
         self.block_tables: List[torch.Tensor] = []
         self.cache_seqlens: List[torch.Tensor] = []
-        self.free_blocks: List[List[int]] = []
+        self.free_block_pools: List[torch.Tensor] = []
+        self.free_block_counts: List[int] = []
 
         self.batch_size: Optional[int] = None
         self.num_kv_heads: Optional[int] = None
@@ -1015,18 +1016,17 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
             raise NotImplementedError("Distributed cache data is not supported for PagedDynamicBudgetTrimKVCache")
 
     def _allocate_blocks(self, layer_idx: int, num_blocks: int) -> torch.Tensor:
-        """Pop num_blocks from the free list. Returns int32 tensor of block indices."""
-        free = self.free_blocks[layer_idx]
-        assert len(free) >= num_blocks, f"Out of free blocks: need {num_blocks}, have {len(free)}"
-        allocated = free[-num_blocks:]
-        del free[-num_blocks:]
-        return torch.tensor(allocated, dtype=torch.int32, device=self.device)
+        """Pop num_blocks from the GPU free pool. No CPU-GPU transfer."""
+        count = self.free_block_counts[layer_idx]
+        assert count >= num_blocks, f"Out of free blocks: need {num_blocks}, have {count}"
+        self.free_block_counts[layer_idx] = count - num_blocks
+        return self.free_block_pools[layer_idx][count - num_blocks:count]
 
-    def _release_blocks(self, layer_idx: int, block_indices):
-        """Return blocks to the free list."""
-        if isinstance(block_indices, torch.Tensor):
-            block_indices = block_indices.tolist()
-        self.free_blocks[layer_idx].extend(block_indices)
+    def _release_blocks(self, layer_idx: int, block_indices: torch.Tensor, num_blocks: int):
+        """Push blocks back to the GPU free pool."""
+        count = self.free_block_counts[layer_idx]
+        self.free_block_pools[layer_idx][count:count + num_blocks] = block_indices
+        self.free_block_counts[layer_idx] = count + num_blocks
 
     def get_total_cached_tokens(self) -> int:
         return sum(self.cache_seqlens[l].sum().item() for l in range(len(self)))
@@ -1075,7 +1075,8 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
                     self.kv_positions.append(torch.tensor([]))
                     self.block_tables.append(torch.tensor([]))
                     self.cache_seqlens.append(torch.tensor([]))
-                    self.free_blocks.append([])
+                    self.free_block_pools.append(torch.tensor([]))
+                    self.free_block_counts.append(0)
 
                 # --- Prefill: pre-allocate page pools and write tokens ---
                 max_blocks_per_seq = (self.max_seq_len + self.page_size - 1) // self.page_size
@@ -1087,7 +1088,8 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
                 self.kv_positions.append(torch.zeros(total_blocks, self.page_size, device=self.device, dtype=cache_positions.dtype))
                 self.block_tables.append(torch.full((num_seqs, max_blocks_per_seq), -1, dtype=torch.int32, device=self.device))
                 self.cache_seqlens.append(torch.zeros(num_seqs, dtype=torch.int32, device=self.device))
-                self.free_blocks.append(list(range(total_blocks)))
+                self.free_block_pools.append(torch.arange(total_blocks, device=self.device, dtype=torch.int32))
+                self.free_block_counts.append(total_blocks)
 
                 # Filter out left-padding tokens on prefill - yejun
                 position_ids = self._position_ids  # (B, S)
@@ -1100,32 +1102,66 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
                     self._per_batch_seen_tokens = real_lens.to(device=self.device, dtype=torch.long)
                     self._seen_tokens = self._seen_tokens - S + real_lens.max().item()
 
-                # Write tokens into pages per (batch, head)
-                for b in range(B):
-                    m = real_mask[b]  # (S,)
-                    real_len = real_lens[b].item()
-                    if real_len == 0:
-                        continue
+                # Write tokens into pages — fully vectorized across B and H
+                max_real_len = real_lens.max().item()
+                if max_real_len > 0:
+                    page_size = self.page_size
+                    max_bph = (max_real_len + page_size - 1) // page_size
 
-                    blocks_per_head = (real_len + self.page_size - 1) // self.page_size
-                    allocated = self._allocate_blocks(layer_idx, H * blocks_per_head)
-                    allocated = allocated.view(H, blocks_per_head)
+                    # Single allocation for all (B*H) sequences, max_bph blocks each
+                    total_alloc = num_seqs * max_bph
+                    allocated = self._allocate_blocks(layer_idx, total_alloc)
+                    allocated = allocated.view(num_seqs, max_bph)  # (num_seqs, max_bph)
+                    self.block_tables[layer_idx][:, :max_bph] = allocated
 
-                    token_idx = torch.arange(real_len, device=self.device)
-                    block_local = token_idx // self.page_size
-                    offsets = token_idx % self.page_size
+                    # Token-to-page mapping
+                    token_idx = torch.arange(max_real_len, device=self.device)
+                    block_local = token_idx // page_size    # (max_real_len,)
+                    offsets = token_idx % page_size          # (max_real_len,)
+                    block_global = allocated[:, block_local]  # (num_seqs, max_real_len)
 
-                    for h in range(H):
-                        seq_idx = b * H + h
-                        self.block_tables[layer_idx][seq_idx, :blocks_per_head] = allocated[h]
+                    # Source indices (left-padded: real tokens are the last real_lens[b] positions)
+                    starts = (S - real_lens).long()  # (B,)
+                    original_idx = starts.unsqueeze(1) + token_idx.unsqueeze(0)  # (B, max_real_len)
+                    original_idx = original_idx.clamp(0, S - 1)
 
-                        block_global = allocated[h][block_local]  # (real_len,)
-                        self.key_cache[layer_idx][block_global, offsets, 0, :] = key_states[b, h, m, :]
-                        self.value_cache[layer_idx][block_global, offsets, 0, :] = value_states[b, h, m, :]
-                        self.retention_weights[layer_idx][block_global, offsets] = retention_weights[b, h, m]
-                        self.kv_positions[layer_idx][block_global, offsets] = cache_positions[b, h, m]
+                    # Gather source data for all (B, H, max_real_len) at once
+                    oi_expand = original_idx.unsqueeze(1).expand(B, H, max_real_len)
+                    oi_kv = oi_expand.unsqueeze(-1).expand(B, H, max_real_len, D)
+                    k_gathered = torch.gather(key_states, 2, oi_kv)          # (B, H, max_real_len, D)
+                    v_gathered = torch.gather(value_states, 2, oi_kv)
+                    rw_gathered = torch.gather(retention_weights, 2, oi_expand)  # (B, H, max_real_len)
+                    pos_gathered = torch.gather(cache_positions, 2, oi_expand)
 
-                    self.cache_seqlens[layer_idx][b * H:(b + 1) * H] = real_len
+                    # Valid mask: token t is valid when t < real_lens[b], same across H heads
+                    token_valid = token_idx.unsqueeze(0) < real_lens.unsqueeze(1)  # (B, max_real_len)
+                    valid_flat = token_valid.unsqueeze(1).expand(B, H, max_real_len).reshape(-1)
+
+                    # Flatten (num_seqs, max_real_len) and filter to valid entries
+                    bg_flat = block_global.reshape(-1)
+                    off_flat = offsets.unsqueeze(0).expand(num_seqs, -1).reshape(-1)
+                    k_flat = k_gathered.reshape(-1, D)
+                    v_flat = v_gathered.reshape(-1, D)
+                    rw_flat = rw_gathered.reshape(-1)
+                    pos_flat = pos_gathered.reshape(-1)
+
+                    vi = valid_flat.nonzero(as_tuple=True)[0]
+                    self.key_cache[layer_idx][bg_flat[vi], off_flat[vi], 0, :] = k_flat[vi]
+                    self.value_cache[layer_idx][bg_flat[vi], off_flat[vi], 0, :] = v_flat[vi]
+                    self.retention_weights[layer_idx][bg_flat[vi], off_flat[vi]] = rw_flat[vi]
+                    self.kv_positions[layer_idx][bg_flat[vi], off_flat[vi]] = pos_flat[vi]
+
+                    self.cache_seqlens[layer_idx] = real_lens.unsqueeze(1).expand(B, H).reshape(num_seqs).int()
+
+                    # Release over-allocated blocks for shorter sequences
+                    actual_bph = (real_lens + page_size - 1) // page_size  # (B,)
+                    actual_bph_per_seq = actual_bph.unsqueeze(1).expand(B, H).reshape(num_seqs)
+                    col_idx = torch.arange(max_bph, device=self.device).unsqueeze(0)
+                    excess_mask = col_idx >= actual_bph_per_seq.unsqueeze(1)  # (num_seqs, max_bph)
+                    if excess_mask.any():
+                        excess_blocks = allocated[excess_mask]
+                        self._release_blocks(layer_idx, excess_blocks, excess_blocks.shape[0])
+                        self.block_tables[layer_idx][:, :max_bph][excess_mask] = -1
 
             else:
                 # --- Decode: append tokens to existing pages ---
@@ -1297,17 +1333,22 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
             self.retention_weights[layer_idx][gap_blocks, gap_offsets] = self.retention_weights[layer_idx][tail_blocks, tail_offsets]
             self.kv_positions[layer_idx][gap_blocks, gap_offsets] = self.kv_positions[layer_idx][tail_blocks, tail_offsets]
 
-        # Update seqlens
+        # Update seqlens and free empty tail pages — fully vectorized
         old_num_blocks = (seqlens + page_size - 1) // page_size
         self.cache_seqlens[layer_idx] = K.int()
         new_num_blocks = torch.where(K > 0, (K + page_size - 1) // page_size, torch.zeros_like(K))
 
-        # Free empty tail pages — small loop only over sequences that freed blocks
-        freed_seqs = (new_num_blocks < old_num_blocks).nonzero(as_tuple=True)[0]
-        for s in freed_seqs.tolist():
-            freed = bt[s, new_num_blocks[s]:old_num_blocks[s]]
-            self._release_blocks(layer_idx, freed[freed >= 0])
-            bt[s, new_num_blocks[s]:old_num_blocks[s]] = -1
+        # Identify all block_table entries to free via a mask over (num_seqs, max_blocks)
+        max_blocks = bt.shape[1]
+        block_col = torch.arange(max_blocks, device=device).unsqueeze(0)  # (1, max_blocks)
+        free_mask = (block_col >= new_num_blocks.unsqueeze(1)) & (block_col < old_num_blocks.unsqueeze(1))
+
+        if free_mask.any():
+            blocks_to_free = bt[free_mask]
+            valid_freed = blocks_to_free[blocks_to_free >= 0]
+            if valid_freed.numel() > 0:
+                self._release_blocks(layer_idx, valid_freed, valid_freed.shape[0])
+            bt[free_mask] = -1
 
     def _compress_layer_paged(
         self,
