@@ -1307,7 +1307,7 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
         valid_mask = torch.arange(max_padded, device=device).unsqueeze(0) < seqlens.unsqueeze(1)
         K = (keep_mask & valid_mask).sum(dim=1)  # (num_seqs,)
 
-        # Identify gaps (positions < K that are NOT kept) and tails (positions >= K that ARE kept)
+        # Identify gaps (positions < K that are not kept) and tails (positions >= K that are kept)
         pos_range = torch.arange(max_padded, device=device).unsqueeze(0)  # (1, max_padded)
         is_front = pos_range < K.unsqueeze(1)
         is_gap = is_front & ~keep_mask & valid_mask
