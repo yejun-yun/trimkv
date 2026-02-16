@@ -1294,7 +1294,6 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
         """Fill-from-tail compaction: swap tail tokens into gaps.
 
         keep_mask: (num_seqs, max_padded) bool — True for tokens to keep.
-        Fully vectorized across all sequences. Cost: O(total_swaps * D) data movement.
         """
         device = self.device
         bt = self.block_tables[layer_idx]
