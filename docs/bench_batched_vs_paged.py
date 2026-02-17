@@ -5,19 +5,19 @@ Measures wall-clock generation time, tokens/sec, and peak GPU memory across
 varying batch sizes, memory budgets, and generation lengths.
 
 Usage:
-    # Quick test (1 config, 1 trial)
-    python examples/bench_batched_vs_paged.py --quick
+    # Quick smoke-test (1 config, 1 trial)
+    python docs/bench_batched_vs_paged.py --quick
 
     # Full sweep (default)
-    python examples/bench_batched_vs_paged.py
+    python docs/bench_batched_vs_paged.py
 
     # Custom sweep
-    python examples/bench_batched_vs_paged.py \
+    python docs/bench_batched_vs_paged.py \
         --model ngocbh/TrimKV-Qwen3-4B-Math \
         --batch-sizes 2 4 \
-        --memory-sizes 256 512 1024 \
-        --max-new-tokens 512 2048 8192 \
-        --trials 3 \
+        --memory-sizes 256 1024 \
+        --max-new-tokens 512 2048 \
+        --trials 2 \
         --warmup 1 \
         --page-size 256 \
         --buffer-size 32 \
@@ -30,7 +30,7 @@ import json
 import os
 import sys
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from itertools import product
 
 import torch
@@ -72,6 +72,7 @@ class TrialResult:
     wall_time_s: float        # end-to-end generation time
     tokens_per_sec: float     # generated_tokens / wall_time_s
     peak_memory_mb: float     # peak GPU memory during generation
+    output_ids: list = field(default=None, repr=False)  # per-seq token ids (optional)
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +104,8 @@ def reset_gpu():
     torch.cuda.reset_peak_memory_stats()
 
 
-def run_generation(model, tokenizer, model_inputs, cache, max_new_tokens):
+def run_generation(model, tokenizer, model_inputs, cache, max_new_tokens,
+                   extra_generate_kwargs=None):
     """Run model.generate and return (output_ids, wall_time_s, peak_mem_mb)."""
     torch.cuda.synchronize()
     reset_gpu()
@@ -116,6 +118,7 @@ def run_generation(model, tokenizer, model_inputs, cache, max_new_tokens):
         **model_inputs,
         max_new_tokens=max_new_tokens,
         past_key_values=cache,
+        **(extra_generate_kwargs or {}),
     )
 
     torch.cuda.synchronize()
@@ -148,6 +151,8 @@ def bench_one(
     buffer_size: int,
     page_size: int,
     trial: int,
+    keep_output: bool = False,
+    greedy: bool = False,
 ) -> TrialResult:
     """Run a single benchmark trial for one (impl, config) combination."""
 
@@ -168,10 +173,23 @@ def bench_one(
     model_inputs = build_inputs(tokenizer, batch_size, model.device)
     prefill_tokens = model_inputs.input_ids.numel()
 
+    generate_kwargs = {}
+    if greedy:
+        generate_kwargs["do_sample"] = False
+
     output_ids, wall_time, peak_mem = run_generation(
         model, tokenizer, model_inputs, cache, max_new_tokens,
+        extra_generate_kwargs=generate_kwargs,
     )
     gen_tokens = count_generated_tokens(model_inputs, output_ids)
+
+    # extract per-sequence generated ids before cleanup
+    per_seq_ids = None
+    if keep_output:
+        per_seq_ids = [
+            out[len(inp):].tolist()
+            for inp, out in zip(model_inputs.input_ids, output_ids)
+        ]
 
     # clean up
     del cache, output_ids, model_inputs
@@ -188,7 +206,85 @@ def bench_one(
         wall_time_s=round(wall_time, 3),
         tokens_per_sec=round(gen_tokens / wall_time, 2) if wall_time > 0 else 0,
         peak_memory_mb=round(peak_mem, 1),
+        output_ids=per_seq_ids,
     )
+
+
+# ---------------------------------------------------------------------------
+# Output equivalence check
+# ---------------------------------------------------------------------------
+
+def check_equivalence(model, tokenizer, batch_sizes, memory_sizes, buffer_size,
+                      page_size, max_new_tokens=256):
+    """Run both impls with greedy decoding and compare outputs token-by-token.
+
+    Uses a short generation (default 256 tokens) — long enough to trigger at
+    least one compression cycle when memory_size + buffer_size < 256 + prefill.
+    """
+    print("=" * 80)
+    print("OUTPUT EQUIVALENCE CHECK  (greedy decoding, do_sample=False)")
+    print("=" * 80)
+
+    all_pass = True
+    for bs in batch_sizes:
+        for mem in memory_sizes:
+            label = f"BS={bs}, mem={mem}, max_new={max_new_tokens}"
+
+            results = {}
+            for impl in ("batched", "paged"):
+                torch.manual_seed(42)
+                torch.cuda.manual_seed_all(42)
+                r = bench_one(
+                    model, tokenizer, impl, bs, mem, max_new_tokens,
+                    buffer_size, page_size, trial=0,
+                    keep_output=True, greedy=True,
+                )
+                results[impl] = r
+
+            batched_ids = results["batched"].output_ids
+            paged_ids = results["paged"].output_ids
+
+            config_pass = True
+            for seq_idx, (b_seq, p_seq) in enumerate(zip(batched_ids, paged_ids)):
+                if b_seq == p_seq:
+                    continue
+
+                config_pass = False
+                # find first divergence
+                min_len = min(len(b_seq), len(p_seq))
+                diverge_pos = min_len  # assume diverges at the end if lengths differ
+                for k in range(min_len):
+                    if b_seq[k] != p_seq[k]:
+                        diverge_pos = k
+                        break
+
+                print(
+                    f"  MISMATCH  {label}, seq {seq_idx}: "
+                    f"diverges at token {diverge_pos} "
+                    f"(batched len={len(b_seq)}, paged len={len(p_seq)})"
+                )
+                # show a few tokens around the divergence
+                lo = max(0, diverge_pos - 2)
+                hi = min(min_len, diverge_pos + 3)
+                print(f"    batched[{lo}:{hi}] = {b_seq[lo:hi]}")
+                print(f"    paged  [{lo}:{hi}] = {p_seq[lo:hi]}")
+
+            status = "PASS" if config_pass else "FAIL"
+            print(f"  [{status}]  {label}")
+            if not config_pass:
+                all_pass = False
+
+    print()
+    if all_pass:
+        print("All equivalence checks passed.")
+    else:
+        print(
+            "WARNING: Some outputs diverged. This can happen when compression "
+            "tie-breaking differs between implementations (topk on equal scores). "
+            "Check that divergence only occurs AFTER the first compression cycle."
+        )
+    print()
+    return all_pass
 
 
 # ---------------------------------------------------------------------------
@@ -283,14 +379,14 @@ def main():
         "--batch-sizes", type=int, nargs="+", default=[2, 4],
     )
     parser.add_argument(
-        "--memory-sizes", type=int, nargs="+", default=[256, 512, 1024],
+        "--memory-sizes", type=int, nargs="+", default=[256, 1024],
     )
     parser.add_argument(
-        "--max-new-tokens", type=int, nargs="+", default=[512, 2048, 8192],
+        "--max-new-tokens", type=int, nargs="+", default=[512, 2048],
     )
     parser.add_argument("--buffer-size", type=int, default=32)
     parser.add_argument("--page-size", type=int, default=256)
-    parser.add_argument("--trials", type=int, default=3)
+    parser.add_argument("--trials", type=int, default=2)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--output", type=str, default=None,
                         help="Path to save JSON results")
@@ -302,6 +398,14 @@ def main():
         "--impls", nargs="+", default=["batched", "paged"],
         choices=["batched", "paged"],
         help="Which implementations to benchmark",
+    )
+    parser.add_argument(
+        "--no-check-equivalence", action="store_true",
+        help="Skip the output equivalence check that runs before the timing sweep",
+    )
+    parser.add_argument(
+        "--check-tokens", type=int, default=256,
+        help="Max tokens to generate during equivalence check (default: 256)",
     )
     args = parser.parse_args()
 
@@ -341,6 +445,20 @@ def main():
         f"x ({args.warmup}W + {args.trials}T) = {total_runs} runs\n"
     )
 
+    # -- equivalence check --
+    if not args.no_check_equivalence:
+        if len(args.impls) < 2:
+            print("Skipping equivalence check (need both impls).\n")
+        else:
+            check_equivalence(
+                model, tokenizer,
+                batch_sizes=args.batch_sizes,
+                memory_sizes=args.memory_sizes,
+                buffer_size=args.buffer_size,
+                page_size=args.page_size,
+                max_new_tokens=args.check_tokens,
+            )
+
     # -- warmup --
     if args.warmup > 0:
         print("--- Warmup ---")
@@ -375,9 +493,14 @@ def main():
 
     # -- save --
     if args.output:
+        def _serialize(r):
+            d = asdict(r)
+            d.pop("output_ids", None)
+            return d
+
         data = {
             "args": vars(args),
-            "results": [asdict(r) for r in results],
+            "results": [_serialize(r) for r in results],
         }
         with open(args.output, "w") as f:
             json.dump(data, f, indent=2)
