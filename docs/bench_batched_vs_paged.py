@@ -14,7 +14,7 @@ Usage:
     # Custom sweep
     python examples/bench_batched_vs_paged.py \
         --model ngocbh/TrimKV-Qwen3-4B-Math \
-        --batch-sizes 1 2 4 \
+        --batch-sizes 2 4 \
         --memory-sizes 256 512 1024 \
         --max-new-tokens 512 2048 8192 \
         --trials 3 \
@@ -280,7 +280,7 @@ def main():
         choices=["huggingface", "wandb", "local"],
     )
     parser.add_argument(
-        "--batch-sizes", type=int, nargs="+", default=[1, 2, 4],
+        "--batch-sizes", type=int, nargs="+", default=[2, 4],
     )
     parser.add_argument(
         "--memory-sizes", type=int, nargs="+", default=[256, 512, 1024],
