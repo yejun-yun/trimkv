@@ -1052,6 +1052,24 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
         self.free_block_pool[count:count + num_blocks] = block_indices
         self.free_block_count = count + num_blocks
 
+    def _prealloc_decode_blocks(self, num_seqs: int, S: int):
+        """Pre-allocate blocks for ALL layers for the next S decode steps.
+
+        Called once at layer_idx == 0.  Replaces N per-layer allocation calls
+        (each with a GPU→CPU sync) with a single batched allocation.
+        """
+        NL = self._num_layers_initialized
+        seqlens = self.cache_seqlens[:NL]               # (NL, num_seqs)
+        step_range = torch.arange(S, device=self.device) # (S,)
+        effective_lens = seqlens.unsqueeze(2) + step_range  # (NL, num_seqs, S)
+        need_new = (effective_lens % self.page_size == 0)   # (NL, num_seqs, S)
+        total_new = need_new.sum().item()
+        if total_new > 0:
+            new_blocks = self._allocate_blocks(total_new)
+            indices = need_new.nonzero(as_tuple=True)       # (layer_idxs, seq_idxs, step_idxs)
+            page_idx = (effective_lens[indices] // self.page_size).long()
+            self.block_tables[indices[0], indices[1], page_idx] = new_blocks
+
     def get_total_cached_tokens(self) -> int:
         if self.cache_seqlens is None:
             return 0
@@ -1177,21 +1195,17 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
                 # --- Decode: append tokens to existing pages ---
                 cache_positions = self._position_ids.unsqueeze(1).expand(B, H, S)  # (B, H, S)
 
+                # Pre-allocate blocks for ALL layers at layer 0 (one sync instead of N)
+                if layer_idx == 0:
+                    self._prealloc_decode_blocks(num_seqs, S)
+
+                seq_arange = torch.arange(num_seqs, device=self.device)
                 for s in range(S):
                     cur_lens = self.cache_seqlens[layer_idx]  # (num_seqs,)
                     page_indices = cur_lens // self.page_size
                     offsets = cur_lens % self.page_size
 
-                    # Allocate new pages where current page is full
-                    need_new_page = (offsets == 0)
-                    if need_new_page.any():
-                        num_new = need_new_page.sum().item()
-                        new_blocks = self._allocate_blocks(num_new)
-                        seqs_needing = need_new_page.nonzero(as_tuple=True)[0]
-                        self.block_tables[layer_idx, seqs_needing, page_indices[seqs_needing]] = new_blocks
-
-                    # Get physical block index for each sequence
-                    seq_arange = torch.arange(num_seqs, device=self.device)
+                    # Block already in block_table (pre-allocated at layer 0)
                     block_indices = self.block_tables[layer_idx, seq_arange, page_indices]
 
                     # Write token s for all (batch, head) pairs at once
@@ -1300,6 +1314,59 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
         scores[~valid_mask] = float('-inf')
         return scores, valid_mask, max_padded
 
+    def _read_scores_all_layers(self, num_layers: int, strategy: str):
+        """Vectorized score reading across all layers in one gather.
+
+        Returns:
+            scores_by_batch: (num_layers, B, H * max_padded)
+            valid_by_batch:  (num_layers, B, H * max_padded) bool
+            max_padded: int  (uniform across layers, padded to global max)
+        """
+        device = self.device
+        B = self.batch_size
+        H = self.num_kv_heads
+        num_seqs = B * H
+        page_size = self.page_size
+        NL = num_layers
+
+        seqlens = self.cache_seqlens[:NL]                         # (NL, num_seqs)
+        max_seqlen = seqlens.max().item()
+        if max_seqlen == 0:
+            empty = torch.empty(NL, B, 0, device=device)
+            return empty, empty.bool(), 0
+
+        max_blocks_used = (max_seqlen + page_size - 1) // page_size
+        max_padded = max_blocks_used * page_size
+
+        # Single batched gather for all layers
+        bt = self.block_tables[:NL, :, :max_blocks_used]          # (NL, num_seqs, mbu)
+        flat_blocks = bt.clamp(min=0).long().reshape(-1)          # (NL * num_seqs * mbu)
+
+        rw = self.retention_weights[flat_blocks].reshape(NL, num_seqs, max_padded)
+        pos = self.kv_positions[flat_blocks].reshape(NL, num_seqs, max_padded)
+
+        # Valid mask: (NL, num_seqs, max_padded)
+        valid_mask = torch.arange(max_padded, device=device) < seqlens.unsqueeze(2)
+
+        # Scores: (NL, num_seqs, max_padded)
+        batch_idx = torch.arange(num_seqs, device=device) // H
+        q_idx = (self._per_batch_seen_tokens + 1)[batch_idx]     # (num_seqs,)
+        scores = (q_idx.unsqueeze(0).unsqueeze(2) - pos) * rw
+
+        if strategy in ["knorm_alpha", "knorm_alpha_threshold"]:
+            k_gathered = self.key_cache[flat_blocks]
+            key_norm = k_gathered.reshape(NL, num_seqs, max_padded, -1).norm(dim=-1)
+            scores = scores + torch.log(key_norm.clamp_min(1e-12))
+        elif strategy not in ["alpha", "alpha_threshold"]:
+            raise ValueError(f"Unknown compression strategy: {strategy}")
+
+        scores[~valid_mask] = float('-inf')
+
+        # Reshape: (NL, B, H * max_padded)
+        scores_by_batch = scores.reshape(NL, B, H * max_padded)
+        valid_by_batch = valid_mask.reshape(NL, B, H * max_padded)
+        return scores_by_batch, valid_by_batch, max_padded
+
     def _apply_eviction_paged(self, layer_idx: int, keep_mask: torch.Tensor):
         """Fill-from-tail compaction: swap tail tokens into gaps.
 
@@ -1359,6 +1426,73 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
                 self._release_blocks(valid_freed, valid_freed.shape[0])
             bt[free_mask] = -1
 
+    def _apply_eviction_all_layers(self, num_layers: int, keep_mask: torch.Tensor):
+        """Vectorized eviction across all layers in one pass.
+
+        keep_mask: (num_layers, num_seqs, max_padded) bool
+        """
+        device = self.device
+        NL = num_layers
+        num_seqs = keep_mask.shape[1]
+        max_padded = keep_mask.shape[2]
+        page_size = self.page_size
+
+        bt = self.block_tables[:NL]                             # (NL, num_seqs, max_blocks_per_seq) — view
+        seqlens = self.cache_seqlens[:NL]                       # (NL, num_seqs) — view
+
+        # Flatten (NL, num_seqs) -> (NL * num_seqs) to process all at once
+        flat_seqlens = seqlens.reshape(-1)
+        flat_keep = keep_mask.reshape(-1, max_padded)
+
+        valid_mask = torch.arange(max_padded, device=device) < flat_seqlens.unsqueeze(1)
+        K = (flat_keep & valid_mask).sum(dim=1)                 # (NL * num_seqs,)
+
+        # Gaps (< K, not kept) and tails (>= K, kept)
+        pos_range = torch.arange(max_padded, device=device).unsqueeze(0)
+        is_front = pos_range < K.unsqueeze(1)
+        is_gap = is_front & ~flat_keep & valid_mask
+        is_tail = ~is_front & flat_keep & valid_mask
+
+        gap_all = is_gap.nonzero(as_tuple=False)
+        tail_all = is_tail.nonzero(as_tuple=False)
+
+        if gap_all.shape[0] > 0:
+            flat_idx_g, gap_pos = gap_all[:, 0], gap_all[:, 1]
+            flat_idx_t, tail_pos = tail_all[:, 0], tail_all[:, 1]
+
+            # Map flat index back to (layer, seq)
+            gap_layer = flat_idx_g // num_seqs
+            gap_seq = flat_idx_g % num_seqs
+            tail_layer = flat_idx_t // num_seqs
+            tail_seq = flat_idx_t % num_seqs
+
+            gap_blocks = bt[gap_layer, gap_seq, gap_pos // page_size].long()
+            gap_offsets = gap_pos % page_size
+            tail_blocks = bt[tail_layer, tail_seq, tail_pos // page_size].long()
+            tail_offsets = tail_pos % page_size
+
+            self.key_cache[gap_blocks, gap_offsets] = self.key_cache[tail_blocks, tail_offsets]
+            self.value_cache[gap_blocks, gap_offsets] = self.value_cache[tail_blocks, tail_offsets]
+            self.retention_weights[gap_blocks, gap_offsets] = self.retention_weights[tail_blocks, tail_offsets]
+            self.kv_positions[gap_blocks, gap_offsets] = self.kv_positions[tail_blocks, tail_offsets]
+
+        # Update seqlens and free empty tail pages
+        old_num_blocks = (flat_seqlens + page_size - 1) // page_size
+        self.cache_seqlens[:NL] = K.reshape(NL, num_seqs).int()
+        new_num_blocks = torch.where(K > 0, (K + page_size - 1) // page_size, torch.zeros_like(K))
+
+        flat_bt = bt.reshape(-1, bt.shape[2])                  # (NL * num_seqs, max_blocks_per_seq)
+        max_blocks = bt.shape[2]
+        block_col = torch.arange(max_blocks, device=device).unsqueeze(0)
+        free_mask = (block_col >= new_num_blocks.unsqueeze(1)) & (block_col < old_num_blocks.unsqueeze(1))
+
+        if free_mask.any():
+            blocks_to_free = flat_bt[free_mask]
+            valid_freed = blocks_to_free[blocks_to_free >= 0]
+            if valid_freed.numel() > 0:
+                self._release_blocks(valid_freed, valid_freed.shape[0])
+            flat_bt[free_mask] = -1
+
     def _compress_layer_paged(
         self,
         layer_idx: int,
@@ -1401,29 +1535,21 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
         num_layers = self._num_layers_initialized if num_layers is None else num_layers
         B = self.batch_size
         H = self.num_kv_heads
+        num_seqs = B * H
 
         total_budget_per_batch = num_layers * H * memory_size
 
-        tokens_per_batch_current = sum(
-            self.cache_seqlens[l].sum().item() for l in range(num_layers)
-        ) // B
+        tokens_per_batch_current = self.cache_seqlens[:num_layers].sum().item() // B
         if tokens_per_batch_current <= num_layers * H * (memory_size + buffer_size) and "threshold" not in strategy:
             return
 
-        # Compute scores for all layers
-        all_scores_by_batch = []
-        all_valid_by_batch = []
-        all_max_padded = []
+        # Vectorized score reading across all layers (one batched gather)
+        scores_by_batch, valid_by_batch, max_padded = self._read_scores_all_layers(num_layers, strategy)
+        # scores_by_batch: (NL, B, H * max_padded)
 
-        for l in range(num_layers):
-            scores, valid_mask, max_padded = self._read_scores_from_pages(l, strategy)
-            all_scores_by_batch.append(scores.view(B, H * max_padded))
-            all_valid_by_batch.append(valid_mask.view(B, H * max_padded))
-            all_max_padded.append(max_padded)
-
-        # Pool per batch across all layers
-        pooled_scores = torch.cat(all_scores_by_batch, dim=1)  # (B, total_cols)
-        pooled_valid = torch.cat(all_valid_by_batch, dim=1)
+        # Pool across layers per batch: (B, NL * H * max_padded)
+        pooled_scores = scores_by_batch.permute(1, 0, 2).reshape(B, -1)
+        pooled_valid = valid_by_batch.permute(1, 0, 2).reshape(B, -1)
 
         if "threshold" in strategy:
             keep_pooled = pooled_scores >= torch.log(torch.tensor(alpha_threshold, device=device))
@@ -1435,15 +1561,9 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
 
         keep_pooled &= pooled_valid
 
-        # Split back to per-layer masks and apply eviction
-        col_offset = 0
-        num_seqs = B * H
-        for l in range(num_layers):
-            cols = H * all_max_padded[l]
-            layer_keep = keep_pooled[:, col_offset:col_offset + cols]
-            keep_mask = layer_keep.reshape(num_seqs, all_max_padded[l])
-            self._apply_eviction_paged(l, keep_mask)
-            col_offset += cols
+        # Reshape back to (NL, num_seqs, max_padded) and apply vectorized eviction
+        keep_mask = keep_pooled.reshape(B, num_layers, H * max_padded).permute(1, 0, 2).reshape(num_layers, num_seqs, max_padded)
+        self._apply_eviction_all_layers(num_layers, keep_mask)
 
     def log(self):
         num_layers = self._num_layers_initialized
