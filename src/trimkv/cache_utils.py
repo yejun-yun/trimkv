@@ -985,24 +985,30 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
         self,
         max_seq_len: int = 20480,
         page_size: int = 256,
+        num_layers: Optional[int] = None,
         _distributed_cache_data: Iterable = None,
         device: str = "cuda",
     ) -> None:
         super().__init__()
         self.max_seq_len = max_seq_len
         self.page_size = page_size
+        self.num_layers = num_layers
         assert page_size % 256 == 0, f"page_size must be divisible by 256 (flash_attn requirement), got {page_size}"
 
         self._seen_tokens = 0
-        self.key_cache: List[torch.Tensor] = []
-        self.value_cache: List[torch.Tensor] = []
-        self.retention_weights: List[torch.Tensor] = []
-        self.kv_positions: List[torch.Tensor] = []
 
-        self.block_tables: List[torch.Tensor] = []
-        self.cache_seqlens: List[torch.Tensor] = []
-        self.free_block_pools: List[torch.Tensor] = []
-        self.free_block_counts: List[int] = []
+        # Unified pool tensors — allocated on first prefill
+        self.key_cache: Optional[torch.Tensor] = None
+        self.value_cache: Optional[torch.Tensor] = None
+        self.retention_weights: Optional[torch.Tensor] = None
+        self.kv_positions: Optional[torch.Tensor] = None
+
+        self.block_tables: Optional[torch.Tensor] = None
+        self.cache_seqlens: Optional[torch.Tensor] = None
+        self.free_block_pool: Optional[torch.Tensor] = None
+        self.free_block_count: int = 0
+
+        self._num_layers_initialized: int = 0
 
         self.batch_size: Optional[int] = None
         self.num_kv_heads: Optional[int] = None
@@ -1015,24 +1021,44 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
         if _distributed_cache_data is not None:
             raise NotImplementedError("Distributed cache data is not supported for PagedDynamicBudgetTrimKVCache")
 
-    def _allocate_blocks(self, layer_idx: int, num_blocks: int) -> torch.Tensor:
-        """Pop num_blocks from the GPU free pool. No CPU-GPU transfer."""
-        count = self.free_block_counts[layer_idx]
-        assert count >= num_blocks, f"Out of free blocks: need {num_blocks}, have {count}"
-        self.free_block_counts[layer_idx] = count - num_blocks
-        return self.free_block_pools[layer_idx][count - num_blocks:count]
+    def __len__(self):
+        return self._num_layers_initialized
 
-    def _release_blocks(self, layer_idx: int, block_indices: torch.Tensor, num_blocks: int):
-        """Push blocks back to the GPU free pool."""
-        count = self.free_block_counts[layer_idx]
-        self.free_block_pools[layer_idx][count:count + num_blocks] = block_indices
-        self.free_block_counts[layer_idx] = count + num_blocks
+    def _allocate_unified_pool(self, B: int, H: int, D: int, key_dtype, value_dtype, rw_dtype, pos_dtype):
+        """Allocate the unified block pool on first prefill."""
+        max_blocks_per_seq = (self.max_seq_len + self.page_size - 1) // self.page_size
+        num_seqs = B * H
+        total_blocks = self.num_layers * num_seqs * max_blocks_per_seq
+
+        self.key_cache = torch.zeros(total_blocks, self.page_size, 1, D, device=self.device, dtype=key_dtype)
+        self.value_cache = torch.zeros(total_blocks, self.page_size, 1, D, device=self.device, dtype=value_dtype)
+        self.retention_weights = torch.zeros(total_blocks, self.page_size, device=self.device, dtype=rw_dtype)
+        self.kv_positions = torch.zeros(total_blocks, self.page_size, device=self.device, dtype=pos_dtype)
+        self.block_tables = torch.full((self.num_layers, num_seqs, max_blocks_per_seq), -1, dtype=torch.int32, device=self.device)
+        self.cache_seqlens = torch.zeros(self.num_layers, num_seqs, dtype=torch.int32, device=self.device)
+        self.free_block_pool = torch.arange(total_blocks, device=self.device, dtype=torch.int32)
+        self.free_block_count = total_blocks
+
+    def _allocate_blocks(self, num_blocks: int) -> torch.Tensor:
+        """Pop num_blocks from the unified GPU free pool."""
+        count = self.free_block_count
+        assert count >= num_blocks, f"Out of free blocks: need {num_blocks}, have {count}"
+        self.free_block_count = count - num_blocks
+        return self.free_block_pool[count - num_blocks:count]
+
+    def _release_blocks(self, block_indices: torch.Tensor, num_blocks: int):
+        """Push blocks back to the unified GPU free pool."""
+        count = self.free_block_count
+        self.free_block_pool[count:count + num_blocks] = block_indices
+        self.free_block_count = count + num_blocks
 
     def get_total_cached_tokens(self) -> int:
-        return sum(self.cache_seqlens[l].sum().item() for l in range(len(self)))
+        if self.cache_seqlens is None:
+            return 0
+        return self.cache_seqlens[:self._num_layers_initialized].sum().item()
 
     def get_cache_length(self, layer_idx: int = 0, batch_idx: int = 0, head_idx: int = 0) -> int:
-        if layer_idx >= len(self.key_cache):
+        if self.cache_seqlens is None or layer_idx >= self._num_layers_initialized:
             return 0
         seq_idx = batch_idx * self.num_kv_heads + head_idx
         return self.cache_seqlens[layer_idx][seq_idx].item()
@@ -1066,32 +1092,16 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
 
             num_seqs = B * H
 
-            if len(self.key_cache) <= layer_idx:
-                # Fill skipped layers with empty tensors
-                for _ in range(len(self.key_cache), layer_idx):
-                    self.key_cache.append(torch.tensor([]))
-                    self.value_cache.append(torch.tensor([]))
-                    self.retention_weights.append(torch.tensor([]))
-                    self.kv_positions.append(torch.tensor([]))
-                    self.block_tables.append(torch.tensor([]))
-                    self.cache_seqlens.append(torch.tensor([]))
-                    self.free_block_pools.append(torch.tensor([]))
-                    self.free_block_counts.append(0)
+            if self._num_layers_initialized <= layer_idx:
+                # --- Prefill ---
+                if self.key_cache is None:
+                    # First layer: allocate the unified pool
+                    assert self.num_layers is not None, "num_layers must be set for PagedDynamicBudgetTrimKVCache"
+                    self._allocate_unified_pool(B, H, D, key_states.dtype, value_states.dtype, retention_weights.dtype, cache_positions.dtype)
 
-                # --- Prefill: pre-allocate page pools and write tokens ---
-                max_blocks_per_seq = (self.max_seq_len + self.page_size - 1) // self.page_size
-                total_blocks = num_seqs * max_blocks_per_seq
+                self._num_layers_initialized = layer_idx + 1
 
-                self.key_cache.append(torch.zeros(total_blocks, self.page_size, 1, D, device=self.device, dtype=key_states.dtype))
-                self.value_cache.append(torch.zeros(total_blocks, self.page_size, 1, D, device=self.device, dtype=value_states.dtype))
-                self.retention_weights.append(torch.zeros(total_blocks, self.page_size, device=self.device, dtype=retention_weights.dtype))
-                self.kv_positions.append(torch.zeros(total_blocks, self.page_size, device=self.device, dtype=cache_positions.dtype))
-                self.block_tables.append(torch.full((num_seqs, max_blocks_per_seq), -1, dtype=torch.int32, device=self.device))
-                self.cache_seqlens.append(torch.zeros(num_seqs, dtype=torch.int32, device=self.device))
-                self.free_block_pools.append(torch.arange(total_blocks, device=self.device, dtype=torch.int32))
-                self.free_block_counts.append(total_blocks)
-
-                # Filter out left-padding tokens on prefill - yejun
+                # Filter out left-padding tokens on prefill
                 position_ids = self._position_ids  # (B, S)
                 real_mask = self._prefill_padding_mask.bool()  # (B, S)
                 cache_positions = position_ids.unsqueeze(1).expand(B, H, S)  # (B, H, S)
@@ -1110,9 +1120,9 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
 
                     # Single allocation for all (B*H) sequences, max_bph blocks each
                     total_alloc = num_seqs * max_bph
-                    allocated = self._allocate_blocks(layer_idx, total_alloc)
+                    allocated = self._allocate_blocks(total_alloc)
                     allocated = allocated.view(num_seqs, max_bph)  # (num_seqs, max_bph)
-                    self.block_tables[layer_idx][:, :max_bph] = allocated
+                    self.block_tables[layer_idx, :, :max_bph] = allocated
 
                     # Token-to-page mapping
                     token_idx = torch.arange(max_real_len, device=self.device)
@@ -1146,10 +1156,10 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
                     pos_flat = pos_gathered.reshape(-1)
 
                     vi = valid_flat.nonzero(as_tuple=True)[0]
-                    self.key_cache[layer_idx][bg_flat[vi], off_flat[vi], 0, :] = k_flat[vi]
-                    self.value_cache[layer_idx][bg_flat[vi], off_flat[vi], 0, :] = v_flat[vi]
-                    self.retention_weights[layer_idx][bg_flat[vi], off_flat[vi]] = rw_flat[vi]
-                    self.kv_positions[layer_idx][bg_flat[vi], off_flat[vi]] = pos_flat[vi]
+                    self.key_cache[bg_flat[vi], off_flat[vi], 0, :] = k_flat[vi]
+                    self.value_cache[bg_flat[vi], off_flat[vi], 0, :] = v_flat[vi]
+                    self.retention_weights[bg_flat[vi], off_flat[vi]] = rw_flat[vi]
+                    self.kv_positions[bg_flat[vi], off_flat[vi]] = pos_flat[vi]
 
                     self.cache_seqlens[layer_idx] = real_lens.unsqueeze(1).expand(B, H).reshape(num_seqs).int()
 
@@ -1160,8 +1170,8 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
                     excess_mask = col_idx >= actual_bph_per_seq.unsqueeze(1)  # (num_seqs, max_bph)
                     if excess_mask.any():
                         excess_blocks = allocated[excess_mask]
-                        self._release_blocks(layer_idx, excess_blocks, excess_blocks.shape[0])
-                        self.block_tables[layer_idx][:, :max_bph][excess_mask] = -1
+                        self._release_blocks(excess_blocks, excess_blocks.shape[0])
+                        self.block_tables[layer_idx, :, :max_bph][excess_mask] = -1
 
             else:
                 # --- Decode: append tokens to existing pages ---
@@ -1176,13 +1186,13 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
                     need_new_page = (offsets == 0)
                     if need_new_page.any():
                         num_new = need_new_page.sum().item()
-                        new_blocks = self._allocate_blocks(layer_idx, num_new)
+                        new_blocks = self._allocate_blocks(num_new)
                         seqs_needing = need_new_page.nonzero(as_tuple=True)[0]
-                        self.block_tables[layer_idx][seqs_needing, page_indices[seqs_needing]] = new_blocks
+                        self.block_tables[layer_idx, seqs_needing, page_indices[seqs_needing]] = new_blocks
 
                     # Get physical block index for each sequence
                     seq_arange = torch.arange(num_seqs, device=self.device)
-                    block_indices = self.block_tables[layer_idx][seq_arange, page_indices]
+                    block_indices = self.block_tables[layer_idx, seq_arange, page_indices]
 
                     # Write token s for all (batch, head) pairs at once
                     k_flat = key_states[:, :, s, :].reshape(num_seqs, D)
@@ -1190,10 +1200,10 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
                     rw_flat = retention_weights[:, :, s].reshape(num_seqs)
                     pos_flat = cache_positions[:, :, s].reshape(num_seqs)
 
-                    self.key_cache[layer_idx][block_indices, offsets, 0, :] = k_flat
-                    self.value_cache[layer_idx][block_indices, offsets, 0, :] = v_flat
-                    self.retention_weights[layer_idx][block_indices, offsets] = rw_flat
-                    self.kv_positions[layer_idx][block_indices, offsets] = pos_flat
+                    self.key_cache[block_indices, offsets, 0, :] = k_flat
+                    self.value_cache[block_indices, offsets, 0, :] = v_flat
+                    self.retention_weights[block_indices, offsets] = rw_flat
+                    self.kv_positions[block_indices, offsets] = pos_flat
 
                     self.cache_seqlens[layer_idx] += 1
 
@@ -1204,7 +1214,7 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
             "num_kv_heads": self.num_kv_heads,
         }
 
-        return self.key_cache[layer_idx], self.value_cache[layer_idx], self.retention_weights[layer_idx], self.kv_positions[layer_idx], flash_attn_kwargs
+        return self.key_cache, self.value_cache, self.retention_weights, self.kv_positions, flash_attn_kwargs
 
     @torch.no_grad()
     def compress(
@@ -1218,7 +1228,7 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
         num_key_value_heads: Optional[int] = None,
         skip_layers: int = 0,
     ):
-        num_layers = len(self.key_cache) if num_layers is None else num_layers
+        num_layers = self._num_layers_initialized if num_layers is None else num_layers
         num_key_value_heads = self.num_kv_heads if num_key_value_heads is None else num_key_value_heads
         B = self.batch_size
         H = num_key_value_heads
@@ -1270,8 +1280,8 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
         max_padded = max_blocks_used * page_size
 
         active_blocks = bt[:, :max_blocks_used].clamp(min=0).long()
-        rw = self.retention_weights[layer_idx][active_blocks].reshape(num_seqs, max_padded)
-        pos = self.kv_positions[layer_idx][active_blocks].reshape(num_seqs, max_padded)
+        rw = self.retention_weights[active_blocks].reshape(num_seqs, max_padded)
+        pos = self.kv_positions[active_blocks].reshape(num_seqs, max_padded)
 
         valid_mask = torch.arange(max_padded, device=device).unsqueeze(0) < seqlens.unsqueeze(1)
 
@@ -1281,7 +1291,7 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
         scores = (q_idx.unsqueeze(1) - pos) * rw
 
         if strategy in ["knorm_alpha", "knorm_alpha_threshold"]:
-            k_gathered = self.key_cache[layer_idx][active_blocks]
+            k_gathered = self.key_cache[active_blocks]
             key_norm = k_gathered.reshape(num_seqs, max_padded, -1).norm(dim=-1)
             scores = scores + torch.log(key_norm.clamp_min(1e-12))
         elif strategy not in ["alpha", "alpha_threshold"]:
@@ -1327,10 +1337,10 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
             tail_offsets = tail_pos % page_size
 
             # Single vectorized scatter for all sequences
-            self.key_cache[layer_idx][gap_blocks, gap_offsets] = self.key_cache[layer_idx][tail_blocks, tail_offsets]
-            self.value_cache[layer_idx][gap_blocks, gap_offsets] = self.value_cache[layer_idx][tail_blocks, tail_offsets]
-            self.retention_weights[layer_idx][gap_blocks, gap_offsets] = self.retention_weights[layer_idx][tail_blocks, tail_offsets]
-            self.kv_positions[layer_idx][gap_blocks, gap_offsets] = self.kv_positions[layer_idx][tail_blocks, tail_offsets]
+            self.key_cache[gap_blocks, gap_offsets] = self.key_cache[tail_blocks, tail_offsets]
+            self.value_cache[gap_blocks, gap_offsets] = self.value_cache[tail_blocks, tail_offsets]
+            self.retention_weights[gap_blocks, gap_offsets] = self.retention_weights[tail_blocks, tail_offsets]
+            self.kv_positions[gap_blocks, gap_offsets] = self.kv_positions[tail_blocks, tail_offsets]
 
         # Update seqlens and free empty tail pages — fully vectorized
         old_num_blocks = (seqlens + page_size - 1) // page_size
@@ -1346,7 +1356,7 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
             blocks_to_free = bt[free_mask]
             valid_freed = blocks_to_free[blocks_to_free >= 0]
             if valid_freed.numel() > 0:
-                self._release_blocks(layer_idx, valid_freed, valid_freed.shape[0])
+                self._release_blocks(valid_freed, valid_freed.shape[0])
             bt[free_mask] = -1
 
     def _compress_layer_paged(
@@ -1388,7 +1398,7 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
         num_layers: Optional[int] = None,
     ):
         device = self.device
-        num_layers = len(self.key_cache) if num_layers is None else num_layers
+        num_layers = self._num_layers_initialized if num_layers is None else num_layers
         B = self.batch_size
         H = self.num_kv_heads
 
@@ -1436,7 +1446,7 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
             col_offset += cols
 
     def log(self):
-        num_layers = len(self.cache_seqlens)
+        num_layers = self._num_layers_initialized
         B = self.batch_size
         H = self.num_kv_heads
         page_size = self.page_size
@@ -1452,7 +1462,7 @@ class PagedDynamicBudgetTrimKVCache(TrimKVCache):
                         continue
                     num_blocks = (L + page_size - 1) // page_size
                     blocks = self.block_tables[l][seq_idx, :num_blocks].long()
-                    pos = self.kv_positions[l][blocks].reshape(-1)[:L]
+                    pos = self.kv_positions[blocks].reshape(-1)[:L]
                     head_wise_kv_positions.append(pos.detach().cpu())
 
         logs = {

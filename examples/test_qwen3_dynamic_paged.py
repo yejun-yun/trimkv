@@ -45,7 +45,7 @@ texts = [
 ]
 
 model_inputs = tokenizer(texts, return_tensors="pt", padding=True).to(model.device)
-past_key_values = PagedDynamicBudgetTrimKVCache(page_size=256, device='cuda')
+past_key_values = PagedDynamicBudgetTrimKVCache(page_size=256, num_layers=model.config.num_hidden_layers, device='cuda')
 
 generated_ids = model.generate(
     **model_inputs,

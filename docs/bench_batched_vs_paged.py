@@ -162,7 +162,7 @@ def bench_one(
         cache = BatchedDynamicBudgetTrimKVCache(device="cuda")
     elif impl == "paged":
         model.config._attn_implementation = "db_attn_flash_paged"
-        cache = PagedDynamicBudgetTrimKVCache(page_size=page_size, device="cuda")
+        cache = PagedDynamicBudgetTrimKVCache(page_size=page_size, num_layers=model.config.num_hidden_layers, device="cuda")
     else:
         raise ValueError(f"Unknown implementation: {impl}")
 
@@ -176,6 +176,9 @@ def bench_one(
     generate_kwargs = {}
     if greedy:
         generate_kwargs["do_sample"] = False
+        generate_kwargs["temperature"] = None
+        generate_kwargs["top_p"] = None
+        generate_kwargs["top_k"] = None
 
     output_ids, wall_time, peak_mem = run_generation(
         model, tokenizer, model_inputs, cache, max_new_tokens,
