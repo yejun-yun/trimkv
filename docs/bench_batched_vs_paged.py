@@ -22,6 +22,16 @@ Usage:
         --page-size 256 \
         --buffer-size 32 \
         --output results.json
+
+    # Stress-test compression (small budgets = frequent compression, long gen)
+    python docs/bench_batched_vs_paged.py \
+        --batch-sizes 2 4 \
+        --memory-sizes 64 128 256 \
+        --max-new-tokens 2048 8192 \
+        --buffer-size 32 \
+        --page-size 256 \
+        --trials 2 \
+        --check-tokens 512
 """
 
 import argparse
